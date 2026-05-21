@@ -14,14 +14,38 @@ changed get a new header and a new embedding.
 
 ---
 
+## Try it yourself
+
+Just want to kick the tires? Three commands:
+
+```bash
+# 1. Install from GitHub
+uv tool install --python 3.12 git+https://github.com/VanshJP/tokenuinely
+
+# 2. Grab API keys (free tiers are plenty for personal use):
+#    - Anthropic: https://console.anthropic.com/settings/keys
+#    - Voyage:    https://dash.voyageai.com/api-keys
+export ANTHROPIC_API_KEY=sk-ant-...
+export VOYAGE_API_KEY=pa-...
+
+# 3. cd into any repo you want to play with, then:
+tokenuinely setup
+```
+
+That registers the MCP server with Claude Code and indexes the current repo. Restart Claude Code, then ask it something about your codebase — it'll call `tokenuinely__query` instead of grepping around.
+
+To try it on another repo later: `cd` in and run `tokenuinely index`. Indexing is incremental (content-hashed), so re-runs are cheap.
+
+---
+
 ## Quickstart with Claude Code
 
 **Three commands.** Run these in any terminal:
 
 ```bash
 # 1. Install tokenuinely globally
-uv tool install tokenuinely
-# or:  pipx install tokenuinely
+uv tool install --python 3.12 git+https://github.com/VanshJP/tokenuinely
+# (once published to PyPI, this will simply be:  uv tool install tokenuinely)
 
 # 2. Run the guided setup
 tokenuinely setup
@@ -55,15 +79,15 @@ It's incremental — only changed files cost API calls.
 
 ## Manual install (from source)
 
-If `tokenuinely` isn't on PyPI yet, install directly from a local clone or git URL:
+Until `tokenuinely` is published to PyPI, install from the GitHub repo:
 
 ```bash
-# From a local clone
-git clone <repo-url> tokenuinely && cd tokenuinely
-uv tool install .
+# Direct from git (no clone needed)
+uv tool install --python 3.12 git+https://github.com/VanshJP/tokenuinely
 
-# Or directly from git
-uv tool install git+<repo-url>
+# Or from a local clone
+git clone https://github.com/VanshJP/tokenuinely.git && cd tokenuinely
+uv tool install --python 3.12 .
 ```
 
 Then set your API keys and run setup:
