@@ -38,6 +38,9 @@ def connect(db_path: Path) -> sqlite3.Connection:
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
     _init_schema(conn)
     return conn
 
@@ -112,7 +115,6 @@ def upsert_file(
         "INSERT INTO files_vec (rowid, embedding) VALUES (?, ?)",
         (file_id, _pack(embedding)),
     )
-    conn.commit()
 
 
 def delete_paths(conn: sqlite3.Connection, paths: Iterable[str]) -> int:

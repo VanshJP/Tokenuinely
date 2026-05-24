@@ -15,7 +15,7 @@ from rich.progress import (
 )
 
 from . import db
-from .config import Config, index_db_path
+from .config import EMBED_BATCH_MAX, Config, index_db_path
 from .embedder import Embedder
 from .hasher import hash_bytes
 from .header import HeaderGenerator
@@ -31,22 +31,19 @@ class IndexStats:
     failed: list[tuple[str, str]] = field(default_factory=list)
 
 
-async def _process_one(
+async def _generate_header(
     wf: WalkedFile,
-    content_hash: str,
     header_gen: HeaderGenerator,
-    embedder: Embedder,
     sem: asyncio.Semaphore,
-) -> tuple[str, str, list[float]] | tuple[None, str, str]:
+) -> tuple[WalkedFile, str | None, str | None]:
     async with sem:
         try:
             header = await header_gen.generate(
                 wf.rel_path, wf.language, wf.content, wf.truncated
             )
-            embedding = await embedder.embed_document(header)
-            return wf.rel_path, header, embedding
+            return wf, header, None
         except Exception as e:  # noqa: BLE001
-            return None, wf.rel_path, f"{type(e).__name__}: {e}"
+            return wf, None, f"{type(e).__name__}: {e}"
 
 
 async def index_repo(repo_root: Path, cfg: Config, console: Console | None = None) -> IndexStats:
@@ -84,9 +81,12 @@ async def index_repo(repo_root: Path, cfg: Config, console: Console | None = Non
 
     header_gen = HeaderGenerator(cfg.anthropic_api_key)
     embedder = Embedder(cfg.voyage_api_key)
-    sem = asyncio.Semaphore(cfg.concurrency)
+    header_sem = asyncio.Semaphore(cfg.header_concurrency)
 
     now = datetime.now(timezone.utc).isoformat()
+
+    DONE: object = object()
+    embed_queue: asyncio.Queue[object] = asyncio.Queue()
 
     with Progress(
         TextColumn("[bold]indexing"),
@@ -98,26 +98,53 @@ async def index_repo(repo_root: Path, cfg: Config, console: Console | None = Non
     ) as progress:
         task_id = progress.add_task("indexing", total=len(work))
 
-        async def runner(wf: WalkedFile, ch: str) -> None:
-            result = await _process_one(wf, ch, header_gen, embedder, sem)
-            if result[0] is None:
-                _, path, err = result
-                stats.failed.append((path, err))
-            else:
-                path, header, embedding = result
-                db.upsert_file(
-                    conn,
-                    path=path,
-                    content_hash=ch,
-                    header=header,
-                    language=wf.language,
-                    generated_at=now,
-                    embedding=embedding,
-                )
-                stats.indexed += 1
-            progress.advance(task_id)
+        async def producer() -> None:
+            async def one(wf: WalkedFile, ch: str) -> None:
+                wf2, header, err = await _generate_header(wf, header_gen, header_sem)
+                if err or header is None:
+                    stats.failed.append((wf2.rel_path, err or "empty header"))
+                    progress.advance(task_id)
+                else:
+                    await embed_queue.put((wf2, ch, header))
 
-        await asyncio.gather(*(runner(wf, ch) for wf, ch in work))
+            await asyncio.gather(*(one(wf, ch) for wf, ch in work))
+            for _ in range(cfg.embed_workers):
+                await embed_queue.put(DONE)
+
+        async def consumer() -> None:
+            while True:
+                item = await embed_queue.get()
+                if item is DONE:
+                    return
+                batch: list[tuple[WalkedFile, str, str]] = [item]  # type: ignore[list-item]
+                while len(batch) < EMBED_BATCH_MAX:
+                    try:
+                        nxt = embed_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nxt is DONE:
+                        await embed_queue.put(DONE)
+                        break
+                    batch.append(nxt)  # type: ignore[arg-type]
+                headers = [h for _, _, h in batch]
+                vecs = await embedder.embed_documents(headers)
+                for (wf2, ch, header), vec in zip(batch, vecs):
+                    db.upsert_file(
+                        conn,
+                        path=wf2.rel_path,
+                        content_hash=ch,
+                        header=header,
+                        language=wf2.language,
+                        generated_at=now,
+                        embedding=vec,
+                    )
+                    stats.indexed += 1
+                    progress.advance(task_id)
+                conn.commit()
+
+        await asyncio.gather(
+            producer(), *[consumer() for _ in range(cfg.embed_workers)]
+        )
 
     db.set_meta(conn, "last_index_at", now)
     conn.close()

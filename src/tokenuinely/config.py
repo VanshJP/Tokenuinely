@@ -15,6 +15,9 @@ HEADER_MODEL = "claude-haiku-4-5-20251001"
 MAX_FILE_BYTES = 100_000
 HEADER_INPUT_CHAR_LIMIT = 40_000
 
+EMBED_BATCH_MAX = 128
+EMBED_TOKEN_BUDGET = 280_000
+
 INDEX_DIRNAME = ".tokenuinely"
 INDEX_FILENAME = "index.db"
 
@@ -80,7 +83,14 @@ DEFAULT_IGNORES = [
 class Config:
     anthropic_api_key: str
     voyage_api_key: str
-    concurrency: int = 10
+    header_concurrency: int = 16
+    embed_workers: int = 2
+    concurrency: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.concurrency is not None:
+            self.header_concurrency = self.concurrency
+        self.concurrency = self.header_concurrency
 
     @classmethod
     def load(cls) -> "Config":
