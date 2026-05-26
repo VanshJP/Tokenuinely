@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
+use super::ts_lang::{c_declarator_name, field_text, make_parser};
 use serde::Serialize;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolInfo {
@@ -27,22 +28,6 @@ pub fn detect_language(file_path: &str) -> Option<String> {
         "cpp" | "cc" | "cxx" | "hpp" => Some("cpp".into()),
         _ => None,
     }
-}
-
-fn make_parser(language: &str) -> Option<Parser> {
-    let mut parser = Parser::new();
-    let lang: tree_sitter::Language = match language {
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "c" | "cpp" => tree_sitter_c::LANGUAGE.into(),
-        _ => return None,
-    };
-    parser.set_language(&lang).ok()?;
-    Some(parser)
 }
 
 /// Extract symbol definitions from source code.
@@ -120,12 +105,7 @@ fn container_name(node: &Node, src: &[u8], lang: &str) -> Option<String> {
 // Per-language symbol extraction
 // ---------------------------------------------------------------------------
 
-fn node_to_symbol(
-    node: &Node,
-    src: &[u8],
-    lang: &str,
-    parent: Option<&str>,
-) -> Option<SymbolInfo> {
+fn node_to_symbol(node: &Node, src: &[u8], lang: &str, parent: Option<&str>) -> Option<SymbolInfo> {
     match lang {
         "rust" => rust_symbol(node, src, parent),
         "python" => python_symbol(node, src, parent),
@@ -208,13 +188,7 @@ fn js_symbol(node: &Node, src: &[u8], parent: Option<&str>) -> Option<SymbolInfo
     match node.kind() {
         "function_declaration" => {
             let name = field_text(node, "name", src)?;
-            Some(make_sym(
-                name,
-                "function",
-                node,
-                src,
-                parent,
-            ))
+            Some(make_sym(name, "function", node, src, parent))
         }
         "class_declaration" => {
             let name = field_text(node, "name", src)?;
@@ -246,23 +220,17 @@ fn go_symbol(node: &Node, src: &[u8], parent: Option<&str>) -> Option<SymbolInfo
         "method_declaration" => {
             let name = field_text(node, "name", src)?;
             // Extract receiver type as parent
-            let receiver = node
-                .child_by_field_name("receiver")
-                .and_then(|r| {
-                    // receiver is a parameter_list like (x *Foo)
-                    let mut cur = r.walk();
-                    let result = r.named_children(&mut cur)
-                        .next()
-                        .and_then(|param| {
-                            param
-                                .child_by_field_name("type")
-                                .and_then(|t| {
-                                    let text = t.utf8_text(src).ok()?;
-                                    Some(text.trim_start_matches('*').to_string())
-                                })
-                        });
-                    result
+            let receiver = node.child_by_field_name("receiver").and_then(|r| {
+                // receiver is a parameter_list like (x *Foo)
+                let mut cur = r.walk();
+                let result = r.named_children(&mut cur).next().and_then(|param| {
+                    param.child_by_field_name("type").and_then(|t| {
+                        let text = t.utf8_text(src).ok()?;
+                        Some(text.trim_start_matches('*').to_string())
+                    })
                 });
+                result
+            });
             Some(SymbolInfo {
                 name,
                 kind: "method".to_string(),
@@ -325,13 +293,7 @@ fn c_symbol(node: &Node, src: &[u8], parent: Option<&str>) -> Option<SymbolInfo>
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn make_sym(
-    name: String,
-    kind: &str,
-    node: &Node,
-    src: &[u8],
-    parent: Option<&str>,
-) -> SymbolInfo {
+fn make_sym(name: String, kind: &str, node: &Node, src: &[u8], parent: Option<&str>) -> SymbolInfo {
     SymbolInfo {
         name,
         kind: kind.to_string(),
@@ -340,13 +302,6 @@ fn make_sym(
         signature: extract_signature(node, src),
         parent: parent.map(|s| s.to_string()),
     }
-}
-
-fn field_text(node: &Node, field: &str, src: &[u8]) -> Option<String> {
-    node.child_by_field_name(field)?
-        .utf8_text(src)
-        .ok()
-        .map(|s| s.to_string())
 }
 
 /// Extract the signature: text from node start up to the body, or first line (≤100 chars).
@@ -373,23 +328,6 @@ fn extract_signature(node: &Node, src: &[u8]) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
-}
-
-/// Recursively unwrap C declarator nodes to find the identifier name.
-fn c_declarator_name(node: &Node, src: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" => node.utf8_text(src).ok().map(|s| s.to_string()),
-        "function_declarator" | "pointer_declarator" | "array_declarator" => node
-            .child_by_field_name("declarator")
-            .and_then(|n| c_declarator_name(&n, src)),
-        "parenthesized_declarator" => {
-            let mut cur = node.walk();
-            let result = node.named_children(&mut cur)
-                .find_map(|child| c_declarator_name(&child, src));
-            result
-        }
-        _ => None,
-    }
 }
 
 /// Extract the typedef name from a C type_definition node.

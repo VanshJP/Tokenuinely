@@ -43,11 +43,7 @@ pub fn import_index(artifact: &Path, repo_root: &Path) -> Result<()> {
     let db_path = dir.join(INDEX_FILENAME);
     std::fs::write(&db_path, &raw).context("Failed to write index database")?;
 
-    eprintln!(
-        "Imported {} bytes to {}",
-        raw.len(),
-        db_path.display()
-    );
+    eprintln!("Imported {} bytes to {}", raw.len(), db_path.display());
 
     Ok(())
 }

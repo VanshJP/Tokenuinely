@@ -104,7 +104,7 @@ pub fn get_architecture(conn: &Connection) -> Result<ArchOverview> {
             file_count,
         })
         .collect();
-    languages.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    languages.sort_by_key(|l| std::cmp::Reverse(l.file_count));
 
     // Top directories: group files by their first path component
     let mut dir_map: HashMap<String, usize> = HashMap::new();
@@ -115,11 +115,7 @@ pub fn get_architecture(conn: &Connection) -> Result<ArchOverview> {
             .filter_map(|r| r.ok());
         for path in paths {
             // Use the first path segment; if no separator, use the filename itself
-            let first = path
-                .split('/')
-                .next()
-                .unwrap_or(&path)
-                .to_string();
+            let first = path.split('/').next().unwrap_or(&path).to_string();
             *dir_map.entry(first).or_insert(0) += 1;
         }
     }
@@ -130,7 +126,7 @@ pub fn get_architecture(conn: &Connection) -> Result<ArchOverview> {
             file_count,
         })
         .collect();
-    top_directories.sort_by(|a, b| b.file_count.cmp(&a.file_count));
+    top_directories.sort_by_key(|d| std::cmp::Reverse(d.file_count));
     top_directories.truncate(10);
 
     // Entry points: symbols named "main" or decorated with entry-point patterns

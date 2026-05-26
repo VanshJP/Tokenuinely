@@ -1,6 +1,5 @@
 use crate::config::{find_repo_root, Config};
-use crate::db::Db;
-use crate::embedder::embed_query;
+use crate::search::query::{search, SearchOpts};
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
@@ -22,7 +21,6 @@ fn extract_search_query(payload: &HookPayload) -> Option<String> {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         "Glob" => {
-            // Clean up glob pattern into natural language
             let pattern = payload
                 .tool_input
                 .get("pattern")
@@ -30,9 +28,7 @@ fn extract_search_query(payload: &HookPayload) -> Option<String> {
                 .unwrap_or("");
             let cleaned = pattern
                 .replace("**", " ")
-                .replace("*", " ")
-                .replace("/", " ")
-                .replace(".", " ")
+                .replace(['*', '/', '.'], " ")
                 .trim()
                 .to_string();
             if cleaned.is_empty() {
@@ -46,16 +42,11 @@ fn extract_search_query(payload: &HookPayload) -> Option<String> {
 }
 
 pub async fn run_hook_augment() -> Result<()> {
-    let result = tokio::time::timeout(Duration::from_millis(300), async {
-        run_hook_inner().await
-    })
-    .await;
-
+    // 600ms budget: per-chunk fused search + (maybe) one Voyage call.
+    let result = tokio::time::timeout(Duration::from_millis(600), run_hook_inner()).await;
     match result {
         Ok(Ok(())) => {}
-        Ok(Err(_)) | Err(_) => {
-            // Timeout or error: exit silently with no stdout
-        }
+        Ok(Err(_)) | Err(_) => { /* fall through silently */ }
     }
     Ok(())
 }
@@ -65,8 +56,8 @@ async fn run_hook_inner() -> Result<()> {
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
 
     let payload: HookPayload = serde_json::from_str(&input)?;
-    let query = extract_search_query(&payload)
-        .ok_or_else(|| anyhow::anyhow!("No query extractable"))?;
+    let query =
+        extract_search_query(&payload).ok_or_else(|| anyhow::anyhow!("No query extractable"))?;
 
     let cfg = Config::load()?;
     let cwd = std::env::current_dir()?;
@@ -74,22 +65,39 @@ async fn run_hook_inner() -> Result<()> {
         .or_else(|| std::env::var("TOKENUINELY_REPO").ok().map(Into::into))
         .ok_or_else(|| anyhow::anyhow!("No index found"))?;
 
-    let db = Db::open(&repo_root)?;
-    let voyage_key = cfg.require_voyage_key()?;
-    let query_vec = embed_query(&query, voyage_key).await?;
-    let results = db.search(&query_vec, 3)?;
+    let opts = SearchOpts {
+        k: 3,
+        include_source: true,
+        // Hook context is shared with the model on every tool call — be stingy.
+        max_chars: 800,
+    };
+    let hits = search(&repo_root, &query, opts, &cfg).await?;
 
-    if results.is_empty() {
+    if hits.is_empty() {
         return Ok(());
     }
 
-    let context_lines: Vec<String> = results
+    let blocks: Vec<String> = hits
         .iter()
-        .map(|r| format!("• {} (score: {:.2})\n  {}", r.path, r.score, r.header))
+        .map(|h| {
+            let loc = match &h.symbol {
+                Some(s) => format!(
+                    "{}:{}-{} [{}] {}",
+                    h.path, h.line_start, h.line_end, h.kind, s
+                ),
+                None => format!("{}:{}-{}", h.path, h.line_start, h.line_end),
+            };
+            let src = h.source.as_deref().unwrap_or("");
+            format!(
+                "▌ {} (score {:.2})\n{}\n```\n{}\n```",
+                loc, h.score, h.header, src
+            )
+        })
         .collect();
+
     let context = format!(
-        "tokenuinely semantic matches:\n{}",
-        context_lines.join("\n")
+        "tokenuinely matches (use these BEFORE re-grepping the same area):\n\n{}",
+        blocks.join("\n\n")
     );
 
     let output = json!({

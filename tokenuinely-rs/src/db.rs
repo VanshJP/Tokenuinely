@@ -1,4 +1,4 @@
-use crate::config::INDEX_DIRNAME;
+use crate::config::{INDEX_DIRNAME, SCHEMA_VERSION};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
@@ -13,14 +13,35 @@ pub struct Db {
 pub struct FileRecord {
     pub path: String,
     pub sha256: String,
-    pub header: String,
     pub indexed_at: i64,
 }
 
-#[derive(Debug, Clone)]
-pub struct QueryResult {
+/// A single retrievable unit: either one top-level symbol or a whole-file fallback.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChunkRecord {
+    pub id: i64,
     pub path: String,
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub line_start: usize,
+    pub line_end: usize,
     pub header: String,
+    pub source: String,
+    pub parent: Option<String>,
+}
+
+/// Result of a fused-ranking search. `source` may be truncated; `truncated` flags it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryHit {
+    pub path: String,
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub header: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    pub truncated: bool,
     pub score: f32,
 }
 
@@ -44,6 +65,24 @@ pub struct DepRecord {
     pub kind: String,
 }
 
+/// `(name, kind, line_start, line_end, signature, parent)` — flat row shape used
+/// when bulk-inserting into the `symbols` table.
+pub type SymbolRow = (String, String, usize, usize, String, Option<String>);
+
+/// `(source_symbol, target_symbol, target_path, kind)` — flat row shape used when
+/// bulk-inserting into the `deps` table.
+pub type DepRow = (Option<String>, String, Option<String>, String);
+
+/// One chunk to upsert. Constructed by the indexer from tree-sitter spans.
+pub struct PendingChunk {
+    pub symbol: Option<String>,
+    pub kind: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub source: String,
+    pub parent: Option<String>,
+}
+
 impl Db {
     pub fn open(repo_root: &Path) -> Result<Self> {
         let dir = repo_root.join(INDEX_DIRNAME);
@@ -52,6 +91,7 @@ impl Db {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         let db = Self { conn };
         db.create_tables()?;
+        db.assert_schema_version()?;
         Ok(db)
     }
 
@@ -61,11 +101,23 @@ impl Db {
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY,
                 sha256 TEXT NOT NULL,
-                header TEXT NOT NULL,
                 indexed_at INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS file_vecs (
-                path TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                symbol TEXT,
+                kind TEXT NOT NULL,
+                line_start INTEGER NOT NULL,
+                line_end INTEGER NOT NULL,
+                header TEXT NOT NULL,
+                source TEXT NOT NULL,
+                parent TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
+            CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol);
+            CREATE TABLE IF NOT EXISTS chunk_vecs (
+                chunk_id INTEGER PRIMARY KEY,
                 embedding BLOB NOT NULL
             );
             CREATE TABLE IF NOT EXISTS adrs (
@@ -106,6 +158,34 @@ impl Db {
         Ok(())
     }
 
+    /// Wipe everything if the stored schema version doesn't match. Cheap because the
+    /// only safe migration story is "throw away and rebuild" — see CLAUDE.md.
+    fn assert_schema_version(&self) -> Result<()> {
+        let current: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        match current.as_deref() {
+            Some(v) if v == SCHEMA_VERSION => Ok(()),
+            Some(_) => {
+                self.conn.execute_batch(
+                    "DELETE FROM files; DELETE FROM chunks; DELETE FROM chunk_vecs; \
+                     DELETE FROM symbols; DELETE FROM deps;",
+                )?;
+                self.set_meta("schema_version", SCHEMA_VERSION)?;
+                Ok(())
+            }
+            None => {
+                self.set_meta("schema_version", SCHEMA_VERSION)?;
+                Ok(())
+            }
+        }
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -122,46 +202,86 @@ impl Db {
         }
     }
 
-    pub fn get_header(&self, path: &str) -> Result<Option<String>> {
-        match self
-            .conn
-            .prepare_cached("SELECT header FROM files WHERE path=?1")?
-            .query_row(params![path], |r| r.get(0))
-        {
-            Ok(v) => Ok(Some(v)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    pub fn upsert(
-        &self,
+    /// Replace all chunks for a file atomically. `pending` is (chunk, header, embedding).
+    pub fn upsert_file_chunks(
+        &mut self,
         path: &str,
         sha256: &str,
-        header: &str,
-        embedding: &[f32],
+        pending: &[(PendingChunk, String, Vec<f32>)],
     ) -> Result<()> {
+        let tx = self.conn.transaction()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO files (path,sha256,header,indexed_at) VALUES(?1,?2,?3,?4)",
-            params![path, sha256, header, now],
+
+        // 1) file row
+        tx.execute(
+            "INSERT OR REPLACE INTO files (path, sha256, indexed_at) VALUES (?1, ?2, ?3)",
+            params![path, sha256, now],
         )?;
-        let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
-        self.conn.execute(
-            "INSERT OR REPLACE INTO file_vecs (path,embedding) VALUES(?1,?2)",
-            params![path, blob],
-        )?;
+
+        // 2) drop any old chunks (and their vecs) for this file
+        let old_ids: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id FROM chunks WHERE path=?1")?;
+            let mut ids = Vec::new();
+            let mut rows = stmt.query(params![path])?;
+            while let Some(row) = rows.next()? {
+                ids.push(row.get::<_, i64>(0)?);
+            }
+            ids
+        };
+        for id in &old_ids {
+            tx.execute("DELETE FROM chunk_vecs WHERE chunk_id=?1", params![id])?;
+        }
+        tx.execute("DELETE FROM chunks WHERE path=?1", params![path])?;
+
+        // 3) insert new chunks + vecs
+        for (chunk, header, embedding) in pending {
+            tx.execute(
+                "INSERT INTO chunks (path, symbol, kind, line_start, line_end, header, source, parent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    path,
+                    &chunk.symbol,
+                    &chunk.kind,
+                    chunk.line_start as i64,
+                    chunk.line_end as i64,
+                    header,
+                    &chunk.source,
+                    &chunk.parent,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            tx.execute(
+                "INSERT INTO chunk_vecs (chunk_id, embedding) VALUES (?1, ?2)",
+                params![id, blob],
+            )?;
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
-    pub fn delete(&self, path: &str) -> Result<()> {
+    pub fn delete_file(&self, path: &str) -> Result<()> {
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare("SELECT id FROM chunks WHERE path=?1")?;
+            let mut acc = Vec::new();
+            let mut rows = stmt.query(params![path])?;
+            while let Some(row) = rows.next()? {
+                acc.push(row.get::<_, i64>(0)?);
+            }
+            acc
+        };
+        for id in ids {
+            self.conn
+                .execute("DELETE FROM chunk_vecs WHERE chunk_id=?1", params![id])?;
+        }
+        self.conn
+            .execute("DELETE FROM chunks WHERE path=?1", params![path])?;
         self.conn
             .execute("DELETE FROM files WHERE path=?1", params![path])?;
-        self.conn
-            .execute("DELETE FROM file_vecs WHERE path=?1", params![path])?;
         self.conn
             .execute("DELETE FROM symbols WHERE path=?1", params![path])?;
         self.conn
@@ -169,13 +289,7 @@ impl Db {
         Ok(())
     }
 
-    /// Insert extracted symbols for a file (clears old symbols for that path first).
-    #[allow(dead_code)]
-    pub fn insert_symbols(
-        &self,
-        path: &str,
-        symbols: &[(String, String, usize, usize, String, Option<String>)],
-    ) -> Result<()> {
+    pub fn replace_symbols(&self, path: &str, symbols: &[SymbolRow]) -> Result<()> {
         self.conn
             .execute("DELETE FROM symbols WHERE path=?1", params![path])?;
         let mut stmt = self.conn.prepare_cached(
@@ -183,20 +297,18 @@ impl Db {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for (name, kind, ls, le, sig, parent) in symbols {
-            stmt.execute(params![path, name, kind, *ls as i64, *le as i64, sig, parent])?;
+            stmt.execute(params![
+                path, name, kind, *ls as i64, *le as i64, sig, parent
+            ])?;
         }
         Ok(())
     }
 
-    /// Insert extracted dependencies for a file (clears old deps for that path first).
-    #[allow(dead_code)]
-    pub fn insert_deps(
-        &self,
-        source_path: &str,
-        deps: &[(Option<String>, String, Option<String>, String)],
-    ) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM deps WHERE source_path=?1", params![source_path])?;
+    pub fn replace_deps(&self, source_path: &str, deps: &[DepRow]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM deps WHERE source_path=?1",
+            params![source_path],
+        )?;
         let mut stmt = self.conn.prepare_cached(
             "INSERT INTO deps (source_path, source_symbol, target_path, target_symbol, kind) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -207,7 +319,6 @@ impl Db {
         Ok(())
     }
 
-    /// Find symbols matching a name pattern and optional kind filter.
     pub fn find_symbols(
         &self,
         name_pattern: &str,
@@ -230,7 +341,6 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Get callers of a symbol (what calls this?).
     pub fn get_callers(&self, symbol_name: &str) -> Result<Vec<DepRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_path, source_symbol, target_path, target_symbol, kind \
@@ -240,7 +350,6 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Get callees of a symbol (what does this call?).
     pub fn get_callees(&self, symbol_name: &str) -> Result<Vec<DepRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_path, source_symbol, target_path, target_symbol, kind \
@@ -250,7 +359,6 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Get imports for a file.
     pub fn get_imports(&self, path: &str) -> Result<Vec<DepRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT source_path, source_symbol, target_path, target_symbol, kind \
@@ -260,7 +368,6 @@ impl Db {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    /// Get files that import this file's symbols.
     #[allow(dead_code)]
     pub fn get_importers(&self, path: &str) -> Result<Vec<DepRecord>> {
         let mut stmt = self.conn.prepare(
@@ -278,18 +385,21 @@ impl Db {
         Ok(paths)
     }
 
-    pub fn stats(&self) -> Result<(usize, Option<i64>)> {
-        let count = self
+    pub fn stats(&self) -> Result<(usize, usize, Option<i64>)> {
+        let files: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))?;
+        let chunks: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+            .unwrap_or(0);
         let last = self
             .conn
             .query_row("SELECT MAX(indexed_at) FROM files", [], |r| r.get(0))
             .ok();
-        Ok((count, last))
+        Ok((files, chunks, last))
     }
 
-    #[allow(dead_code)]
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
@@ -300,50 +410,102 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
-        match self.conn.query_row(
-            "SELECT value FROM meta WHERE key=?1",
-            params![key],
-            |r| r.get(0),
-        ) {
+        match self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| {
+                r.get(0)
+            }) {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    pub fn search(&self, query_vec: &[f32], k: usize) -> Result<Vec<QueryResult>> {
+    /// Return a synthesized file-level header by joining the first few chunk headers.
+    /// Used by detect_changes and hook_augment for display only.
+    pub fn get_header(&self, path: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT fv.path, f.header, fv.embedding \
-             FROM file_vecs fv JOIN files f ON fv.path=f.path",
+            "SELECT symbol, header FROM chunks WHERE path=?1 ORDER BY line_start LIMIT 5",
         )?;
-        let mut results: Vec<(String, String, f32)> = stmt
+        let rows: Vec<(Option<String>, String)> = stmt
+            .query_map(params![path], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let joined: String = rows
+            .iter()
+            .map(|(sym, h)| match sym {
+                Some(s) => format!("[{}] {}", s, h.lines().next().unwrap_or("")),
+                None => h.lines().next().unwrap_or("").to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Some(joined))
+    }
+
+    /// Fetch the chunk row for a given symbol name (best-effort; first match).
+    pub fn get_chunk_for_symbol(&self, symbol: &str) -> Result<Option<ChunkRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, symbol, kind, line_start, line_end, header, source, parent \
+             FROM chunks WHERE symbol = ?1 LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row(params![symbol], |r| {
+                Ok(ChunkRecord {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    symbol: r.get(2)?,
+                    kind: r.get(3)?,
+                    line_start: r.get::<_, i64>(4)? as usize,
+                    line_end: r.get::<_, i64>(5)? as usize,
+                    header: r.get(6)?,
+                    source: r.get(7)?,
+                    parent: r.get(8)?,
+                })
+            })
+            .ok();
+        Ok(row)
+    }
+
+    /// Return every chunk plus its embedding so the caller can score them in-memory.
+    /// Cheap until the corpus grows past ~50k chunks; can be swapped for sqlite-vec later.
+    pub fn all_chunks_with_vecs(&self) -> Result<Vec<(ChunkRecord, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id, c.path, c.symbol, c.kind, c.line_start, c.line_end, \
+                    c.header, c.source, c.parent, cv.embedding \
+             FROM chunks c JOIN chunk_vecs cv ON cv.chunk_id = c.id",
+        )?;
+        let rows = stmt
             .query_map([], |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Vec<u8>>(2)?,
+                    ChunkRecord {
+                        id: r.get(0)?,
+                        path: r.get(1)?,
+                        symbol: r.get(2)?,
+                        kind: r.get(3)?,
+                        line_start: r.get::<_, i64>(4)? as usize,
+                        line_end: r.get::<_, i64>(5)? as usize,
+                        header: r.get(6)?,
+                        source: r.get(7)?,
+                        parent: r.get(8)?,
+                    },
+                    r.get::<_, Vec<u8>>(9)?,
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(p, h, b)| {
-                let emb: Vec<f32> = b
+            .map(|(rec, blob)| {
+                let emb: Vec<f32> = blob
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                     .collect();
-                let score = cosine_similarity(query_vec, &emb);
-                (p, h, score)
+                (rec, emb)
             })
             .collect();
-        results.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(k);
-        Ok(results
-            .into_iter()
-            .map(|(path, header, score)| QueryResult {
-                path,
-                header,
-                score,
-            })
-            .collect())
+        Ok(rows)
     }
 }
 
@@ -369,7 +531,7 @@ fn map_dep_row(r: &rusqlite::Row) -> rusqlite::Result<DepRecord> {
     })
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;
     }

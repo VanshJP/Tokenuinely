@@ -6,11 +6,18 @@ pub const EMBED_DIM: usize = 1024;
 pub const HEADER_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const EMBED_MODEL: &str = "voyage-3";
 pub const MAX_FILE_BYTES: u64 = 100_000;
-pub const HEADER_INPUT_CHAR_LIMIT: usize = 40_000;
+/// Per-chunk source slice fed to the header LLM. Chunks are small by design.
+pub const HEADER_INPUT_CHAR_LIMIT: usize = 6_000;
+/// Per-chunk source bytes returned inline in query results (cap to keep tokens bounded).
+pub const QUERY_SOURCE_CHAR_LIMIT: usize = 2_400;
 pub const EMBED_BATCH_MAX: usize = 128;
 pub const HEADER_CONCURRENCY: usize = 16;
-pub const INDEX_DIRNAME: &str = ".tokenuinely";
+/// Bumped from ".tokenuinely" — v2 stores chunk-level rows instead of file-level.
+/// Old indexes are abandoned; a fresh `tokenuinely index` rebuilds under the new dir.
+pub const INDEX_DIRNAME: &str = ".tokenuinely/v2";
 pub const INDEX_FILENAME: &str = "index.db";
+/// Schema version stored in the `meta` table. Bumped → DB is wiped + rebuilt.
+pub const SCHEMA_VERSION: &str = "2";
 
 pub const DEFAULT_IGNORES: &[&str] = &[
     ".git",
@@ -33,6 +40,7 @@ pub const DEFAULT_IGNORES: &[&str] = &[
     "vendor",
     ".tokenuinely",
     ".onetoken",
+    "tokenuinely-index.zst",
 ];
 
 pub const DEFAULT_IGNORE_EXTENSIONS: &[&str] = &[
@@ -99,9 +107,9 @@ impl Config {
     }
 
     pub fn require_anthropic_key(&self) -> Result<&str> {
-        self.anthropic_api_key
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("ANTHROPIC_API_KEY not set (required for header generation)"))
+        self.anthropic_api_key.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("ANTHROPIC_API_KEY not set (required for header generation)")
+        })
     }
 
     pub fn require_voyage_key(&self) -> Result<&str> {
@@ -120,6 +128,10 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
         if current.join(INDEX_DIRNAME).join(INDEX_FILENAME).exists() {
+            return Some(current);
+        }
+        // Also accept the legacy v1 location so users mid-upgrade aren't stranded.
+        if current.join(".tokenuinely").join("index.db").exists() {
             return Some(current);
         }
         if !current.pop() {

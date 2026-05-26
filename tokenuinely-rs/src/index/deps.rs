@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
+use super::ts_lang::{c_declarator_name, field_text, make_parser};
 use serde::Serialize;
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DepInfo {
@@ -25,27 +26,6 @@ pub fn extract_deps(source: &str, language: &str) -> Vec<DepInfo> {
     let src = source.as_bytes();
     collect_deps(&tree.root_node(), src, language, None, &mut deps);
     deps
-}
-
-// ---------------------------------------------------------------------------
-// Parser construction (mirrors symbols.rs; kept local to avoid cross-module
-// coupling so the user can wire modules independently)
-// ---------------------------------------------------------------------------
-
-fn make_parser(language: &str) -> Option<Parser> {
-    let mut parser = Parser::new();
-    let lang: tree_sitter::Language = match language {
-        "rust" => tree_sitter_rust::LANGUAGE.into(),
-        "python" => tree_sitter_python::LANGUAGE.into(),
-        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        "go" => tree_sitter_go::LANGUAGE.into(),
-        "java" => tree_sitter_java::LANGUAGE.into(),
-        "c" | "cpp" => tree_sitter_c::LANGUAGE.into(),
-        _ => return None,
-    };
-    parser.set_language(&lang).ok()?;
-    Some(parser)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,12 +228,7 @@ fn python_imports(node: &Node, src: &[u8]) -> Vec<DepInfo> {
             let module = parts[0].trim().to_string();
             let mut out = Vec::new();
             for name in parts[1].split(',') {
-                let name = name
-                    .split(" as ")
-                    .next()
-                    .unwrap_or(name)
-                    .trim()
-                    .to_string();
+                let name = name.split(" as ").next().unwrap_or(name).trim().to_string();
                 if !name.is_empty() && name != "*" {
                     out.push(DepInfo {
                         source_symbol: None,
@@ -281,64 +256,58 @@ fn js_imports(node: &Node, src: &[u8]) -> Vec<DepInfo> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "import_clause" => {
-                let mut inner = child.walk();
-                for imp in child.named_children(&mut inner) {
-                    match imp.kind() {
-                        "identifier" => {
-                            if let Ok(name) = imp.utf8_text(src) {
+        if child.kind() != "import_clause" {
+            continue;
+        }
+        let mut inner = child.walk();
+        for imp in child.named_children(&mut inner) {
+            match imp.kind() {
+                "identifier" => {
+                    if let Ok(name) = imp.utf8_text(src) {
+                        out.push(DepInfo {
+                            source_symbol: None,
+                            target_symbol: name.to_string(),
+                            target_path: source_path.clone(),
+                            kind: "imports".to_string(),
+                        });
+                    }
+                }
+                "named_imports" => {
+                    let mut nc = imp.walk();
+                    for spec in imp.named_children(&mut nc) {
+                        if spec.kind() == "import_specifier" {
+                            let name = field_text(&spec, "name", src)
+                                .or_else(|| spec.utf8_text(src).ok().map(|s| s.to_string()));
+                            if let Some(n) = name {
                                 out.push(DepInfo {
                                     source_symbol: None,
-                                    target_symbol: name.to_string(),
+                                    target_symbol: n,
                                     target_path: source_path.clone(),
                                     kind: "imports".to_string(),
                                 });
                             }
                         }
-                        "named_imports" => {
-                            let mut nc = imp.walk();
-                            for spec in imp.named_children(&mut nc) {
-                                if spec.kind() == "import_specifier" {
-                                    let name = field_text(&spec, "name", src)
-                                        .or_else(|| {
-                                            spec.utf8_text(src)
-                                                .ok()
-                                                .map(|s| s.to_string())
-                                        });
-                                    if let Some(n) = name {
-                                        out.push(DepInfo {
-                                            source_symbol: None,
-                                            target_symbol: n,
-                                            target_path: source_path.clone(),
-                                            kind: "imports".to_string(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        "namespace_import" => {
-                            if let Ok(text) = imp.utf8_text(src) {
-                                let alias = text
-                                    .strip_prefix("* as ")
-                                    .unwrap_or(text)
-                                    .trim()
-                                    .to_string();
-                                if !alias.is_empty() {
-                                    out.push(DepInfo {
-                                        source_symbol: None,
-                                        target_symbol: alias,
-                                        target_path: source_path.clone(),
-                                        kind: "imports".to_string(),
-                                    });
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
+                "namespace_import" => {
+                    if let Ok(text) = imp.utf8_text(src) {
+                        let alias = text
+                            .strip_prefix("* as ")
+                            .unwrap_or(text)
+                            .trim()
+                            .to_string();
+                        if !alias.is_empty() {
+                            out.push(DepInfo {
+                                source_symbol: None,
+                                target_symbol: alias,
+                                target_path: source_path.clone(),
+                                kind: "imports".to_string(),
+                            });
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -419,9 +388,7 @@ fn c_imports(node: &Node, src: &[u8]) -> Vec<DepInfo> {
         return vec![];
     }
     let path_node = node.child_by_field_name("path");
-    let text = path_node
-        .and_then(|n| n.utf8_text(src).ok())
-        .unwrap_or("");
+    let text = path_node.and_then(|n| n.utf8_text(src).ok()).unwrap_or("");
     let name = text
         .trim_matches(|c: char| c == '<' || c == '>' || c == '"')
         .to_string();
@@ -491,24 +458,3 @@ fn extract_call(node: &Node, src: &[u8], lang: &str) -> Option<DepInfo> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn field_text(node: &Node, field: &str, src: &[u8]) -> Option<String> {
-    node.child_by_field_name(field)?
-        .utf8_text(src)
-        .ok()
-        .map(|s| s.to_string())
-}
-
-/// Recursively unwrap C declarator nodes to find the identifier name.
-fn c_declarator_name(node: &Node, src: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" => node.utf8_text(src).ok().map(|s| s.to_string()),
-        "function_declarator" | "pointer_declarator" | "array_declarator" => node
-            .child_by_field_name("declarator")
-            .and_then(|n| c_declarator_name(&n, src)),
-        _ => None,
-    }
-}

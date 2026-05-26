@@ -1,7 +1,8 @@
+use crate::config::{INDEX_DIRNAME, INDEX_FILENAME};
 use anyhow::Result;
 use rusqlite::Connection;
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -34,7 +35,9 @@ struct GraphEdge {
 /// Start the 3D graph visualization HTTP server on the given port.
 #[allow(dead_code)]
 pub async fn start_viz_server(repo_root: PathBuf, port: u16) -> Result<()> {
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+    // Bind loopback only — the graph exposes symbol names, file paths, and
+    // call structure of the repo, which we never want reachable from the LAN.
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}")).await?;
     print_viz_banner(port);
 
     loop {
@@ -50,10 +53,7 @@ pub async fn start_viz_server(repo_root: PathBuf, port: u16) -> Result<()> {
 
             let request = String::from_utf8_lossy(&buf[..n]);
             let request_line = request.lines().next().unwrap_or("");
-            let path = request_line
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("/");
+            let path = request_line.split_whitespace().nth(1).unwrap_or("/");
 
             let response = match path {
                 "/" => build_html_response(),
@@ -88,9 +88,10 @@ fn build_html_response() -> String {
     )
 }
 
-fn build_graph_response(repo_root: &PathBuf) -> String {
+fn build_graph_response(repo_root: &Path) -> String {
     let body = match load_graph_data(repo_root) {
-        Ok(data) => serde_json::to_string(&data).unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string()),
+        Ok(data) => serde_json::to_string(&data)
+            .unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string()),
         Err(e) => {
             tracing::warn!("Failed to load graph data: {e}");
             r#"{"nodes":[],"edges":[]}"#.to_string()
@@ -124,8 +125,8 @@ fn build_404_response() -> String {
 
 // ── Database queries ────────────────────────────────────────────────────────
 
-fn load_graph_data(repo_root: &PathBuf) -> Result<GraphData> {
-    let db_path = repo_root.join(".tokenuinely").join("index.db");
+fn load_graph_data(repo_root: &Path) -> Result<GraphData> {
+    let db_path = repo_root.join(INDEX_DIRNAME).join(INDEX_FILENAME);
     let conn = Connection::open(&db_path)?;
 
     let nodes = load_nodes(&conn).unwrap_or_default();
@@ -151,18 +152,13 @@ fn load_nodes(conn: &Connection) -> Result<Vec<GraphNode>> {
         })
     })?;
 
-    let mut nodes = Vec::new();
-    for row in rows {
-        if let Ok(node) = row {
-            nodes.push(node);
-        }
-    }
-    Ok(nodes)
+    Ok(rows.flatten().collect())
 }
 
 fn load_edges(conn: &Connection) -> Result<Vec<GraphEdge>> {
-    let mut stmt =
-        conn.prepare("SELECT source_symbol, target_symbol, kind FROM deps WHERE source_symbol IS NOT NULL")?;
+    let mut stmt = conn.prepare(
+        "SELECT source_symbol, target_symbol, kind FROM deps WHERE source_symbol IS NOT NULL",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(GraphEdge {
             source: row.get(0)?,
@@ -171,13 +167,7 @@ fn load_edges(conn: &Connection) -> Result<Vec<GraphEdge>> {
         })
     })?;
 
-    let mut edges = Vec::new();
-    for row in rows {
-        if let Ok(edge) = row {
-            edges.push(edge);
-        }
-    }
-    Ok(edges)
+    Ok(rows.flatten().collect())
 }
 
 // ── Embedded HTML ───────────────────────────────────────────────────────────

@@ -374,10 +374,7 @@ impl Parser {
                 self.advance();
                 WhereOp::Contains
             }
-            Some(t) => bail!(
-                "Expected '=' or 'CONTAINS' in WHERE clause, got {:?}",
-                t
-            ),
+            Some(t) => bail!("Expected '=' or 'CONTAINS' in WHERE clause, got {:?}", t),
             None => bail!("Unexpected end of input in WHERE clause"),
         };
 
@@ -452,18 +449,12 @@ fn edge_to_dep_kind(edge: &str) -> Result<&'static str> {
     match edge.to_uppercase().as_str() {
         "CALLS" => Ok("calls"),
         "IMPORTS" => Ok("imports"),
-        _ => bail!(
-            "Unknown edge type '{}'. Supported: CALLS, IMPORTS",
-            edge
-        ),
+        _ => bail!("Unknown edge type '{}'. Supported: CALLS, IMPORTS", edge),
     }
 }
 
 /// Build the SELECT column list from the RETURN clause.
-fn build_select(
-    ret: &ReturnClause,
-    aliases: &HashMap<String, String>,
-) -> Result<String> {
+fn build_select(ret: &ReturnClause, aliases: &HashMap<String, String>) -> Result<String> {
     let mut parts = Vec::new();
     for item in &ret.items {
         match item {
@@ -713,8 +704,8 @@ mod tests {
 
     #[test]
     fn tokenize_edge_right() {
-        let tokens = tokenize("MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.name, b.name")
-            .unwrap();
+        let tokens =
+            tokenize("MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.name, b.name").unwrap();
         assert!(tokens.contains(&Token::Dash));
         assert!(tokens.contains(&Token::Gt));
     }
@@ -821,8 +812,7 @@ mod tests {
 
     #[test]
     fn error_on_unknown_property() {
-        let tokens =
-            tokenize("MATCH (f:Function) WHERE f.bogus = 'x' RETURN f.name").unwrap();
+        let tokens = tokenize("MATCH (f:Function) WHERE f.bogus = 'x' RETURN f.name").unwrap();
         let parser = Parser::new(tokens);
         let ast = parser.parse().unwrap();
         let result = translate(&ast);
@@ -833,14 +823,16 @@ mod tests {
 
     #[test]
     fn error_on_unknown_edge() {
-        let tokens =
-            tokenize("MATCH (a:Function)-[:EXTENDS]->(b:Struct) RETURN a.name").unwrap();
+        let tokens = tokenize("MATCH (a:Function)-[:EXTENDS]->(b:Struct) RETURN a.name").unwrap();
         let parser = Parser::new(tokens);
         let ast = parser.parse().unwrap();
         let result = translate(&ast);
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Unknown edge type"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown edge type"));
     }
 
     #[test]
@@ -851,8 +843,7 @@ mod tests {
 
     #[test]
     fn error_on_unknown_variable() {
-        let tokens =
-            tokenize("MATCH (f:Function) WHERE z.name = 'x' RETURN f.name").unwrap();
+        let tokens = tokenize("MATCH (f:Function) WHERE z.name = 'x' RETURN f.name").unwrap();
         let parser = Parser::new(tokens);
         let ast = parser.parse().unwrap();
         let result = translate(&ast);

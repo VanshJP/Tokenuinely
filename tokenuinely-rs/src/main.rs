@@ -1,22 +1,12 @@
 mod adr;
-mod architecture;
 mod config;
-mod cypher;
 mod db;
-mod deps;
 mod detect_changes;
-mod embedder;
 mod export;
-mod fts;
-mod graph_viz;
 mod hasher;
-mod header;
-mod hook_augment;
-mod indexer;
-mod mcp;
-mod query;
-mod symbols;
-mod walker;
+mod index;
+mod search;
+mod server;
 mod watcher;
 
 use anyhow::Result;
@@ -26,8 +16,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "tokenuinely",
-    version = "0.3.0",
-    about = "Semantic codebase index for AI agents — 12 MCP tools, tree-sitter AST, zero-API-key structural search"
+    version = "0.4.0",
+    about = "Chunk-level semantic index for AI agents — 3 MCP tools, tree-sitter AST, fused vector+BM25+exact-symbol ranking"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -197,12 +187,13 @@ async fn main() -> Result<()> {
         Commands::Index { path } => {
             let path = std::fs::canonicalize(&path)?;
             let cfg = config::Config::load()?;
-            let stats = indexer::index_repo(&path, &cfg).await?;
+            let stats = index::indexer::index_repo(&path, &cfg).await?;
             eprintln!(
-                "Done: {} scanned, {} unchanged, {} indexed, {} deleted, {} failed",
+                "Done: {} scanned, {} unchanged, {} indexed ({} chunks), {} deleted, {} failed",
                 stats.scanned,
                 stats.unchanged,
                 stats.indexed,
+                stats.chunks,
                 stats.deleted,
                 stats.failed.len()
             );
@@ -212,24 +203,43 @@ async fn main() -> Result<()> {
         }
         Commands::Query { text, k, path } => {
             let cfg = config::Config::load()?;
+            let opts = search::query::SearchOpts {
+                k,
+                include_source: false,
+                max_chars: 0,
+            };
             let results = if let Some(p) = path {
                 let p = std::fs::canonicalize(&p)?;
-                query::search(&p, &text, k, &cfg).await?
+                search::query::search(&p, &text, opts, &cfg).await?
             } else {
-                query::search_auto(&text, k, &cfg).await?
+                search::query::search_auto(&text, opts, &cfg).await?
             };
             for r in &results {
-                println!("{:.4}  {}  {}", r.score, r.path, r.header.lines().next().unwrap_or(""));
+                let loc = match &r.symbol {
+                    Some(s) => format!("{}:{}-{} {}", r.path, r.line_start, r.line_end, s),
+                    None => format!("{}:{}-{}", r.path, r.line_start, r.line_end),
+                };
+                println!(
+                    "{:.4}  {}  {}",
+                    r.score,
+                    loc,
+                    r.header.lines().next().unwrap_or("")
+                );
             }
         }
         Commands::SearchText { text, k, path } => {
             let path = std::fs::canonicalize(&path)?;
             let db = db::Db::open(&path)?;
-            fts::create_fts_table(db.conn())?;
-            fts::populate_fts(db.conn())?;
-            let results = fts::fts_search(db.conn(), &text, k)?;
+            search::fts::create_fts_table(db.conn())?;
+            search::fts::populate_fts(db.conn())?;
+            let results = search::fts::fts_search(db.conn(), &text, k)?;
             for r in &results {
-                println!("{:.4}  {}  {}", r.rank, r.path, r.header.lines().next().unwrap_or(""));
+                println!(
+                    "{:.4}  {}  {}",
+                    r.rank,
+                    r.path,
+                    r.header.lines().next().unwrap_or("")
+                );
             }
         }
         Commands::FindSymbol { name, kind, path } => {
@@ -253,7 +263,11 @@ async fn main() -> Result<()> {
             if !callers.is_empty() {
                 println!("Called by:");
                 for c in &callers {
-                    println!("  {} ({})", c.source_symbol.as_deref().unwrap_or("?"), c.source_path);
+                    println!(
+                        "  {} ({})",
+                        c.source_symbol.as_deref().unwrap_or("?"),
+                        c.source_path
+                    );
                 }
             }
             if !callees.is_empty() {
@@ -275,13 +289,13 @@ async fn main() -> Result<()> {
         Commands::Architecture { path } => {
             let path = std::fs::canonicalize(&path)?;
             let db = db::Db::open(&path)?;
-            let arch = architecture::get_architecture(db.conn())?;
+            let arch = search::architecture::get_architecture(db.conn())?;
             println!("{}", serde_json::to_string_pretty(&arch)?);
         }
         Commands::DeadCode { path } => {
             let path = std::fs::canonicalize(&path)?;
             let db = db::Db::open(&path)?;
-            let dead = architecture::find_dead_code(db.conn())?;
+            let dead = search::architecture::find_dead_code(db.conn())?;
             if dead.is_empty() {
                 println!("No dead code found.");
             } else {
@@ -294,29 +308,30 @@ async fn main() -> Result<()> {
         Commands::CypherQuery { query: q, path } => {
             let path = std::fs::canonicalize(&path)?;
             let db = db::Db::open(&path)?;
-            let results = cypher::execute_cypher(db.conn(), &q)?;
+            let results = search::cypher::execute_cypher(db.conn(), &q)?;
             println!("{}", serde_json::to_string_pretty(&results)?);
         }
         Commands::Status { path } => {
             let path = std::fs::canonicalize(&path)?;
             let db = db::Db::open(&path)?;
-            let (count, last) = db.stats()?;
+            let (files, chunks, last) = db.stats()?;
             println!("Repo: {}", path.display());
-            println!("Files indexed: {}", count);
+            println!("Files indexed: {}", files);
+            println!("Chunks indexed: {}", chunks);
             if let Some(ts) = last {
                 println!("Last indexed at: {}", ts);
             }
         }
         Commands::Mcp => {
-            mcp::run_mcp_server().await?;
+            server::mcp::run_mcp_server().await?;
         }
         Commands::HookAugment => {
-            hook_augment::run_hook_augment().await?;
+            server::hook_augment::run_hook_augment().await?;
         }
         Commands::Viz { port, path } => {
             let path = std::fs::canonicalize(&path)?;
-            graph_viz::print_viz_banner(port);
-            graph_viz::start_viz_server(path, port).await?;
+            server::viz::print_viz_banner(port);
+            server::viz::start_viz_server(path, port).await?;
         }
         Commands::Export { path, output } => {
             let path = std::fs::canonicalize(&path)?;
@@ -389,7 +404,9 @@ async fn main() -> Result<()> {
                 .status();
             match mcp_status {
                 Ok(s) if s.success() => eprintln!("MCP server registered."),
-                _ => eprintln!("Warning: Could not register MCP server (is `claude` CLI installed?)."),
+                _ => eprintln!(
+                    "Warning: Could not register MCP server (is `claude` CLI installed?)."
+                ),
             }
 
             // Register hook
@@ -430,7 +447,7 @@ async fn main() -> Result<()> {
             if !skip_index {
                 eprintln!("Running initial index...");
                 let cfg = config::Config::load()?;
-                let stats = indexer::index_repo(&path, &cfg).await?;
+                let stats = index::indexer::index_repo(&path, &cfg).await?;
                 eprintln!(
                     "Indexed: {} scanned, {} indexed, {} failed",
                     stats.scanned,

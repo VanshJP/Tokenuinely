@@ -50,48 +50,50 @@ pub fn start_watcher(
     let debounce: std::sync::Arc<Mutex<HashMap<PathBuf, Instant>>> =
         std::sync::Arc::new(Mutex::new(HashMap::new()));
 
-    let mut watcher = notify::recommended_watcher(move |res: std::result::Result<notify::Event, notify::Error>| {
-        let event = match res {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!("Watch error: {e}");
-                return;
-            }
-        };
-
-        // Only care about creates, modifications, and removals.
-        use notify::EventKind;
-        match event.kind {
-            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
-            _ => return,
-        }
-
-        let now = Instant::now();
-        let debounce_dur = Duration::from_millis(DEBOUNCE_MS);
-
-        for path in event.paths {
-            if should_ignore_watch_path(&path) {
-                continue;
-            }
-
-            // Debounce: skip if we sent this path recently.
-            {
-                let mut map = debounce.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(last) = map.get(&path) {
-                    if now.duration_since(*last) < debounce_dur {
-                        continue;
-                    }
+    let mut watcher = notify::recommended_watcher(
+        move |res: std::result::Result<notify::Event, notify::Error>| {
+            let event = match res {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("Watch error: {e}");
+                    return;
                 }
-                map.insert(path.clone(), now);
+            };
+
+            // Only care about creates, modifications, and removals.
+            use notify::EventKind;
+            match event.kind {
+                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {}
+                _ => return,
             }
 
-            // blocking_send is safe here because notify calls us on its own
-            // background thread, outside the tokio runtime.
-            if let Err(e) = tx.blocking_send(path) {
-                tracing::warn!("Watch channel send failed: {e}");
+            let now = Instant::now();
+            let debounce_dur = Duration::from_millis(DEBOUNCE_MS);
+
+            for path in event.paths {
+                if should_ignore_watch_path(&path) {
+                    continue;
+                }
+
+                // Debounce: skip if we sent this path recently.
+                {
+                    let mut map = debounce.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(last) = map.get(&path) {
+                        if now.duration_since(*last) < debounce_dur {
+                            continue;
+                        }
+                    }
+                    map.insert(path.clone(), now);
+                }
+
+                // blocking_send is safe here because notify calls us on its own
+                // background thread, outside the tokio runtime.
+                if let Err(e) = tx.blocking_send(path) {
+                    tracing::warn!("Watch channel send failed: {e}");
+                }
             }
-        }
-    })?;
+        },
+    )?;
 
     watcher.watch(&repo_root, RecursiveMode::Recursive)?;
     tracing::info!("File watcher started on {}", repo_root.display());
