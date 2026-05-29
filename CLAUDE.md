@@ -1,127 +1,116 @@
 # CLAUDE.md
 
 Contributor guide for Claude Code when working *inside* the `tokenuinely`
-source tree. End-user install/usage docs live in `README.md`.
+source tree. End-user install/usage docs live in
+[`tokenuinely-rs/README.md`](tokenuinely-rs/README.md).
 
 ## What this is
 
-`tokenuinely` builds a per-repo semantic index: for every text file it writes a
-compact natural-language header (the "why" + key symbols + external touches +
-redirects), embeds the header with Voyage, and stores both in a local
-SQLite + `sqlite-vec` database at `.tokenuinely/index.db`. A coding agent
-queries that index via the `tokenuinely__query` MCP tool instead of grepping.
+`tokenuinely` builds a per-repo semantic index. It walks a repo, slices each
+file into chunks (one per top-level symbol via tree-sitter), writes a compact
+natural-language header per chunk with Claude, embeds the headers with Voyage,
+and stores chunks + vectors + a symbol/dependency graph in a local SQLite
+database at `.tokenuinely/v2/index.db`. A coding agent queries the index through
+MCP tools instead of grepping.
+
+The project is a single Rust crate in `tokenuinely-rs/` (binary `tokenuinely`,
+edition 2021). The git repo root (`Tokenuinely/`) holds release tooling
+(`dist-workspace.toml`, `.github/workflows/release.yml`).
 
 ## Dev environment
 
-- Python ≥3.10, but the checked-in `.venv` uses 3.12. Always invoke
-  `.venv/bin/python` and `.venv/bin/tokenuinely` directly — there's no
-  `python` on PATH.
-- No test suite, no lint config, no CI in-tree. Don't fabricate `pytest`
-  invocations.
-- Build backend is `hatchling`; source layout is `src/tokenuinely/`.
-- Add or remove deps with `uv add` / `uv remove` (do **not** hand-edit
-  `pyproject.toml` `dependencies`).
+- Rust stable (the crate targets edition 2021). Build with `cargo build`
+  (binary at `tokenuinely-rs/target/debug/tokenuinely`) or `cargo build
+  --release`. Run all cargo commands from inside `tokenuinely-rs/`.
+- `cargo test` — 33 tests, none require API keys. `cargo clippy --all-targets`
+  and `cargo fmt` should stay clean.
+- Add/remove deps with `cargo add` / `cargo remove`.
+- API keys flow through env (`ANTHROPIC_API_KEY`, `VOYAGE_API_KEY`) or a `.env`
+  file loaded by dotenvy.
 
-## Module map
+## Module map (`tokenuinely-rs/src/`)
 
-| File | Role |
+| Path | Role |
 | --- | --- |
-| `cli.py` | Typer app: `index`, `query`, `status`, `mcp`, `setup`. |
-| `mcp_server.py` | FastMCP server exposing `query`, `index_status`, `reindex` tools over stdio. |
-| `indexer.py` | Walk → hash-diff → header-gen (producer) → batched embed (consumer queue) → SQLite upsert. |
-| `header.py` | `HeaderGenerator`: Anthropic call that returns the five-line header. |
-| `embedder.py` | `Embedder`: `voyageai.AsyncClient` wrapper with `embed_query` + batched `embed_documents`. |
-| `db.py` | SQLite + `sqlite-vec` schema, connect (WAL pragmas), upsert/search/delete/meta. |
-| `walker.py` | Filesystem walk honoring `.gitignore` + `DEFAULT_IGNORES`, binary/size filtering, language detection. |
-| `hasher.py` | SHA-256 helper for content-hash dedupe. |
-| `config.py` | `Config` dataclass, model names, byte/char limits, embed batch constants. |
+| `main.rs` | clap CLI: `index`, `query`, `search-text`, `find-symbol`, `trace-deps`, `architecture`, `dead-code`, `cypher-query`, `eval`, `status`, `cache`, `mcp`, `hook-augment`, `viz`, `export`/`import`, `detect-changes`, `adr`, `setup`. |
+| `config.rs` | `Config`, model names, byte/char limits, `SCHEMA_VERSION`, `INDEX_DIRNAME`, `find_repo_root`. |
+| `db.rs` | SQLite schema + connection (WAL), chunk/symbol/dep upserts, FTS-free queries, `encode_embedding`/`decode_embedding`, `cosine_similarity`, `now_unix`, query-cache helpers. |
+| `hasher.rs` | `sha256_file` (whole-file) and `sha256_str` (per-chunk body). |
+| `index/` | `walker` (gitignore/size/binary filtering), `symbols` + `deps` + `ts_lang` (tree-sitter), `header` (Anthropic call), `embedder` (Voyage batch), `indexer` (the pipeline). |
+| `search/` | `query` (fused vec+BM25+exact ranking + cache), `fts` (BM25 over headers), `cypher`, `architecture`. |
+| `server/` | `mcp` (JSON-RPC stdio), `hook_augment` (PreToolUse hook), `viz`. |
+| `eval.rs` | retrieval eval harness (`tokenuinely eval`). |
+| `adr.rs`, `export.rs`, `detect_changes.rs`, `watcher.rs` | ADRs, zstd export/import, git-aware staleness, fs-watch primitive. |
 
 ## Invariants — don't break these
 
-1. **Header label grammar is a public contract.** The five lines and labels
-   (`WHY:`, `SUMMARY:`, `KEY SYMBOLS:`, `TOUCHES:`, `NOT HERE:`) are referenced
-   by `CLAUDE_MD_SNIPPET` in `cli.py`, MCP tool docstrings, and the README.
-   Don't rename or reorder them. Headers already written by older versions
-   (four-line, no `WHY:`) remain in the DB until reindex — code that parses
-   headers must tolerate either shape.
-2. **SQLite schema is append-compatible.** Don't change column types or the
-   `files_vec` dimension (`EMBED_DIM = 1024`, tied to `voyage-3`). A schema
-   change requires a migration story; there is none today.
-3. **Per-call `conn.commit()` was intentionally removed from `db.upsert_file`.**
-   The indexer commits once per consumer batch. If you add new write helpers,
-   either commit there (one-shot writes) or document that the caller commits.
-4. **`Config.concurrency` is a back-compat alias** for `header_concurrency`.
-   Leave the `__post_init__` reconciliation in place; external callers may
-   still pass `concurrency=`.
-5. **Voyage call shape.** Use `Embedder.embed_documents([...])` for bulk and
-   `embed_query(text)` for single queries. Don't reintroduce one-text-per-call
-   document embedding — it was the bottleneck the batched path replaced.
-6. **`max_tokens=260`** in `header.py` is deliberately tight. Raise it only
-   with a real reason; the prompt is built to fit.
-7. **Don't print secrets.** `ANTHROPIC_API_KEY` and `VOYAGE_API_KEY` flow
-   through `Config`; never log them or echo them into errors.
+1. **MCP surface is three tools.** `tokenuinely__query`,
+   `tokenuinely__inspect_symbol`, `tokenuinely__repo_overview` (in
+   `server/mcp.rs`). Their descriptions sit in the agent's context every turn,
+   so keep them tight; niche functionality stays a CLI subcommand.
+2. **Header grammar is a contract.** Chunk headers are `WHY: / EFFECTS: /
+   CALLS:`; whole-file headers (no extractable symbols) are `WHY: / EFFECTS: /
+   NOT HERE:` (see `index/header.rs`). The embedded header is what search
+   matches, so don't rename/reorder labels casually.
+3. **Schema change = wipe and rebuild.** Bump `SCHEMA_VERSION` in `config.rs`
+   and `assert_schema_version` wipes the data tables on next open. There is no
+   migration layer by design. `EMBED_DIM = 1024` is tied to `voyage-3`.
+4. **Per-symbol hash diff.** `chunks.body_sha256` lets a reindex reuse a
+   chunk's stored header+embedding when its body is unchanged — don't drop it;
+   it's the main cost saver. Pair it with the partial-failure path (#5).
+5. **Partial-failure recovery.** A file with some failed chunks is stored with
+   the surviving chunks but a `PARTIAL_INDEX_SENTINEL` (empty) hash, so the next
+   `index` reprocesses it. `file_unchanged()` is the single place that decides a
+   skip — route skip logic through it.
+6. **Don't print secrets.** `ANTHROPIC_API_KEY` / `VOYAGE_API_KEY` never get
+   logged or echoed into errors.
+7. **stdout is the JSON-RPC channel in MCP mode.** All logs go to stderr
+   (`tracing` is configured for stderr). Don't `println!` diagnostics.
 
 ## Data flow (indexer)
 
 ```
-walker.walk(root)
-   │  WalkedFile(rel_path, content, truncated, language)
-   ▼
-hasher.hash_bytes  ──►  db.get_hash  (skip if unchanged)
-   │
-   ▼
-work[]  ──►  producer: _generate_header (under header_sem)
-                       │  (WalkedFile, content_hash, header)
-                       ▼
-                  asyncio.Queue
-                       │
-                       ▼  cfg.embed_workers consumers
-              drain up to EMBED_BATCH_MAX
-              embedder.embed_documents(headers)
-              db.upsert_file × N  →  conn.commit()
+walker::walk_repo(root)                       # gitignore + size/binary/ext filters
+  └─ per file: hasher::sha256_file → file_unchanged()  (skip if unchanged)
+       └─ tree-sitter: extract_symbols + extract_deps → build_chunks (per-symbol body hash)
+            └─ db.existing_chunks_for_reuse → reuse header+embedding if body hash matches
+                 ├─ Phase 1  index/header::generate_chunk_header  (Anthropic, header_concurrency)
+                 ├─ Phase 2  index/embedder::embed_batch          (Voyage, 1024-dim, EMBED_BATCH_MAX)
+                 └─ Phase 3  db.upsert_file_chunks + replace_symbols/replace_deps  (atomic per file)
 ```
 
-Tunables live on `Config`: `header_concurrency` (Anthropic-bound),
-`embed_workers` (parallel batched-embed consumers). Embed batching constants
-(`EMBED_BATCH_MAX`, `EMBED_TOKEN_BUDGET`) are module-level in `config.py`.
+`Config.header_concurrency` bounds the Anthropic calls; embed batching constants
+live in `config.rs`. A successful write clears the query cache (chunk IDs are
+reassigned).
 
-## Running things locally
+## Running things locally (from `tokenuinely-rs/`)
 
 ```bash
-# Status (no API calls)
-.venv/bin/tokenuinely status .
-
-# Full reindex (COSTS Anthropic + Voyage credits — ask the user first)
-.venv/bin/tokenuinely index .
-
-# Query (costs one Voyage embedding call)
-.venv/bin/tokenuinely query "where do we batch embedding requests"
-
-# MCP server (stdio; Claude Code launches this, you rarely run it by hand)
-.venv/bin/tokenuinely mcp
+cargo run -- status .          # no API calls
+cargo run -- index .           # COSTS Anthropic + Voyage credits — ask the user first
+cargo run -- query "where do we batch embedding requests"   # one Voyage call
+cargo run -- eval .            # runs the query pipeline over evals/queries.jsonl — costs Voyage
+cargo run -- mcp               # stdio MCP server; Claude Code launches this
 ```
 
-The index DB lives at `.tokenuinely/index.db`; safe to delete and rebuild.
+The index DB lives at `.tokenuinely/v2/index.db`; safe to delete and rebuild.
+Inspect it read-only with `sqlite3 .tokenuinely/v2/index.db`.
 
 ## Conventions
 
-- `from __future__ import annotations` at the top of every module.
-- Dataclasses for plain records (`Config`, `IndexStats`, `WalkedFile`,
-  `FileRecord`, `QueryHit`).
-- `async`/`await` end-to-end for anything touching Anthropic, Voyage, or the
-  MCP server. SQLite calls stay sync (single event-loop thread).
-- Use `rich.console.Console` and `rich.progress.Progress` for user-facing
-  output — don't reach for `print`.
-- Errors that should bubble to the CLI raise `RuntimeError` with a
-  human-readable message; `cli.py` converts them to `typer.Exit(1)`.
+- Plain records are structs (`Config`, `IndexStats`, `ChunkRecord`,
+  `QueryHit`, `PendingChunk`, …).
+- `async`/`await` for anything touching Anthropic, Voyage, or the MCP server;
+  SQLite calls stay sync.
+- Errors bubble as `anyhow::Result`; `main.rs` surfaces them.
+- User-facing CLI output uses `indicatif` progress bars + `eprintln!`/`println!`
+  per command; structured logs use `tracing` (stderr only).
 
 ## Things to avoid
 
-- Don't run `tokenuinely index` or `tokenuinely query` against this repo
-  without explicit user permission — both spend real API credits.
-- Don't add new top-level packages. The `src/tokenuinely/` layout is
-  intentional (matches `tool.hatch.build.targets.wheel`).
-- Don't create `tests/` or `docs/` directories speculatively. There aren't any
-  yet; adding them is a product decision, not a refactor.
-- Don't hand-edit `.tokenuinely/index.db`. If you need to inspect it, use
-  `sqlite3 .tokenuinely/index.db`.
+- Don't run `index`, `query`, or `eval` against a repo without explicit user
+  permission — they spend real Anthropic/Voyage credits.
+- Don't hand-edit `.tokenuinely/v2/index.db`; use `sqlite3` to inspect.
+- Don't add a migration layer — schema bumps wipe and rebuild on purpose.
+- Don't widen the MCP tool surface or loosen header `max_tokens` without a real
+  reason; both are deliberately tight.

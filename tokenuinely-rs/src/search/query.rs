@@ -376,7 +376,10 @@ mod tests {
         assert!(read_query_cache(&db, &key, &SearchOpts::default())
             .unwrap()
             .is_none());
-        assert!(db.get_meta(&key).unwrap().is_none(), "stale entry not pruned");
+        assert!(
+            db.get_meta(&key).unwrap().is_none(),
+            "stale entry not pruned"
+        );
     }
 
     #[test]

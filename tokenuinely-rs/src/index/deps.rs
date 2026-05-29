@@ -457,4 +457,3 @@ fn extract_call(node: &Node, src: &[u8], lang: &str) -> Option<DepInfo> {
         _ => None,
     }
 }
-

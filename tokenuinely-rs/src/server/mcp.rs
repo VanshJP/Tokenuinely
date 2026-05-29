@@ -136,8 +136,7 @@ async fn handle_tool_call(name: &str, args: &Value, cfg: &Config) -> Result<Valu
             let callees = db.get_callees(sym)?;
             // Did-you-mean: when nothing matched the symbol exactly, surface up to 5
             // fuzzy candidates so the agent can retry instead of getting an empty hit.
-            let exact_hit = definition.is_some()
-                || symbol_rows.iter().any(|s| s.name == sym);
+            let exact_hit = definition.is_some() || symbol_rows.iter().any(|s| s.name == sym);
             let suggestions: Vec<Value> = if exact_hit {
                 Vec::new()
             } else {

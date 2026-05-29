@@ -443,7 +443,10 @@ async fn main() -> Result<()> {
             // Register MCP server with Claude Code. `user` scope makes one
             // registration serve every repo (the server resolves the target repo
             // from the working directory), which is what you want across many repos.
-            eprintln!("Registering MCP server with Claude Code (scope: {})...", scope);
+            eprintln!(
+                "Registering MCP server with Claude Code (scope: {})...",
+                scope
+            );
             let mcp_status = std::process::Command::new("claude")
                 .args([
                     "mcp",
