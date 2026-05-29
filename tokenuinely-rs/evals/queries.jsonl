@@ -1,0 +1,22 @@
+{"query": "how do we compute cosine similarity between two embedding vectors", "expected_path": "src/db.rs", "expected_symbol": "cosine_similarity"}
+{"query": "where do we batch embedding requests to the voyage api", "expected_path": "src/index/embedder.rs", "expected_symbol": "embed_batch"}
+{"query": "embed a single query string for semantic search", "expected_path": "src/index/embedder.rs", "expected_symbol": "embed_query"}
+{"query": "find the repo root by walking up parent directories", "expected_path": "src/config.rs", "expected_symbol": "find_repo_root"}
+{"query": "strip fts5 syntax characters so natural language queries dont error", "expected_path": "src/search/fts.rs", "expected_symbol": "sanitize_fts_query"}
+{"query": "full text search over chunk headers and symbol names", "expected_path": "src/search/fts.rs", "expected_symbol": "fts_search_chunks"}
+{"query": "fused ranking combining vector bm25 and exact symbol scores", "expected_path": "src/search/query.rs", "expected_symbol": "search"}
+{"query": "slice a source file into one chunk per top level symbol", "expected_path": "src/index/indexer.rs", "expected_symbol": "build_chunks"}
+{"query": "the main indexing pipeline walk hash header embed upsert", "expected_path": "src/index/indexer.rs", "expected_symbol": "index_repo"}
+{"query": "compute the sha256 hash of a file on disk", "expected_path": "src/hasher.rs", "expected_symbol": "sha256_file"}
+{"query": "run the mcp stdio json-rpc server loop", "expected_path": "src/server/mcp.rs", "expected_symbol": "run_mcp_server"}
+{"query": "list the mcp tools and their input schemas", "expected_path": "src/server/mcp.rs", "expected_symbol": "tools_list"}
+{"query": "replace all chunks for a file atomically in sqlite", "expected_path": "src/db.rs", "expected_symbol": "upsert_file_chunks"}
+{"query": "load every chunk together with its embedding vector", "expected_path": "src/db.rs", "expected_symbol": "all_chunks_with_vecs"}
+{"query": "find symbol definitions matching a name pattern", "expected_path": "src/db.rs", "expected_symbol": "find_symbols"}
+{"query": "what other functions call this symbol", "expected_path": "src/db.rs", "expected_symbol": "get_callers"}
+{"query": "extract import and call dependencies with tree-sitter", "expected_path": "src/index/deps.rs", "expected_symbol": "extract_deps"}
+{"query": "walk the repository honoring gitignore and skip binaries", "expected_path": "src/index/walker.rs", "expected_symbol": "walk_repo"}
+{"query": "find dead code functions that have zero callers", "expected_path": "src/search/architecture.rs", "expected_symbol": "find_dead_code"}
+{"query": "generate a natural language header for a code chunk", "expected_path": "src/index/header.rs", "expected_symbol": "generate_chunk_header"}
+{"query": "detect the programming language from a file path", "expected_path": "src/index/symbols.rs", "expected_symbol": "detect_language"}
+{"query": "carry forward an unchanged symbols header and embedding on reindex", "expected_path": "src/db.rs", "expected_symbol": "existing_chunks_for_reuse"}

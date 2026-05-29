@@ -1,8 +1,10 @@
 use super::fts;
-use crate::config::{find_repo_root, Config, QUERY_SOURCE_CHAR_LIMIT};
-use crate::db::{cosine_similarity, ChunkRecord, Db, QueryHit};
+use crate::config::{find_repo_root, Config, QUERY_CACHE_TTL_SECS, QUERY_SOURCE_CHAR_LIMIT};
+use crate::db::{cosine_similarity, now_unix, ChunkRecord, Db, QueryHit};
+use crate::hasher::sha256_str;
 use crate::index::embedder::embed_query;
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -36,6 +38,16 @@ pub async fn search(
     cfg: &Config,
 ) -> Result<Vec<QueryHit>> {
     let db = Db::open(repo_root)?;
+
+    // (0) Query cache: identical (query, k, mode) within the TTL replays the prior
+    // chunk IDs and skips the Voyage embedding call. Rows are re-fetched by ID so
+    // even a cache hit reflects the latest indexed source.
+    let semantic = cfg.voyage_api_key.is_some();
+    let cache_key = query_cache_key(query_text, opts.k, semantic);
+    if let Some(hits) = read_query_cache(&db, &cache_key, &opts)? {
+        tracing::info!(query = query_text, k = opts.k, "query cache hit");
+        return Ok(hits);
+    }
 
     // (1) FTS over chunk headers + symbol names (no API key needed).
     fts::create_fts_table(db.conn())?;
@@ -89,7 +101,16 @@ pub async fn search(
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(opts.k);
 
-    Ok(scored
+    // Cache the winning chunk IDs (+ fused scores) for replay within the TTL.
+    let ordered: Vec<(i64, f32)> = scored.iter().map(|(c, s)| (c.id, *s)).collect();
+    write_query_cache(&db, &cache_key, &ordered)?;
+
+    Ok(build_hits(scored, &opts))
+}
+
+/// Turn ranked `(chunk, score)` pairs into `QueryHit`s, applying the source cap.
+fn build_hits(scored: Vec<(ChunkRecord, f32)>, opts: &SearchOpts) -> Vec<QueryHit> {
+    scored
         .into_iter()
         .map(|(c, score)| {
             let (source, truncated) = if opts.include_source {
@@ -110,7 +131,7 @@ pub async fn search(
                 score,
             }
         })
-        .collect())
+        .collect()
 }
 
 pub async fn search_auto(
@@ -125,6 +146,73 @@ pub async fn search_auto(
         Some(root) => search(&root, query_text, opts, cfg).await,
         None => bail!("No tokenuinely index found. Run `tokenuinely index` first."),
     }
+}
+
+// ---- query cache ----
+
+#[derive(Serialize, Deserialize)]
+struct CacheEntry {
+    ts: i64,
+    /// Ranked `(chunk_id, fused_score)` from the cached search.
+    hits: Vec<(i64, f32)>,
+}
+
+/// Cache key folds in `k` and whether semantic (vec) ranking was active, so an
+/// FTS-only result never masquerades as a semantic one.
+fn query_cache_key(query: &str, k: usize, semantic: bool) -> String {
+    format!(
+        "cache:{}",
+        sha256_str(&format!("{}\u{0}{}\u{0}{}", query, k, semantic))
+    )
+}
+
+/// Return cached hits if a fresh entry exists. Expired or dangling entries are
+/// dropped so the cache self-prunes at read time.
+fn read_query_cache(db: &Db, key: &str, opts: &SearchOpts) -> Result<Option<Vec<QueryHit>>> {
+    let raw = match db.get_meta(key)? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let entry: CacheEntry = match serde_json::from_str(&raw) {
+        Ok(e) => e,
+        Err(_) => {
+            db.delete_meta(key)?;
+            return Ok(None);
+        }
+    };
+    if now_unix() - entry.ts >= QUERY_CACHE_TTL_SECS {
+        db.delete_meta(key)?;
+        return Ok(None);
+    }
+    let ids: std::collections::HashSet<i64> = entry.hits.iter().map(|(id, _)| *id).collect();
+    let mut by_id: HashMap<i64, ChunkRecord> = fetch_chunks_by_ids(db, &ids)?
+        .into_iter()
+        .map(|c| (c.id, c))
+        .collect();
+    // Preserve the cached ranking; skip any chunk that vanished since (e.g. reindex).
+    // `remove` moves each record out of the throwaway map rather than cloning it.
+    let ordered: Vec<(ChunkRecord, f32)> = entry
+        .hits
+        .iter()
+        .filter_map(|(id, score)| by_id.remove(id).map(|c| (c, *score)))
+        .collect();
+    if ordered.is_empty() {
+        db.delete_meta(key)?;
+        return Ok(None);
+    }
+    Ok(Some(build_hits(ordered, opts)))
+}
+
+fn write_query_cache(db: &Db, key: &str, ordered: &[(i64, f32)]) -> Result<()> {
+    if ordered.is_empty() {
+        return Ok(());
+    }
+    let entry = CacheEntry {
+        ts: now_unix(),
+        hits: ordered.to_vec(),
+    };
+    db.set_meta(key, &serde_json::to_string(&entry)?)?;
+    Ok(())
 }
 
 // ---- helpers ----
@@ -226,4 +314,78 @@ fn cap_source(s: &str, max_chars: usize) -> (String, bool) {
     let mut out = s[..cut].to_string();
     out.push_str("\n…");
     (out, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use tempfile::TempDir;
+
+    fn db_with_chunk() -> (TempDir, Db, i64) {
+        let tmp = TempDir::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO chunks (path, symbol, kind, line_start, line_end, header, source, parent, body_sha256) \
+                 VALUES ('src/x.rs','foo','function',1,5,'WHY: x','fn foo() {}',NULL,'abc')",
+                [],
+            )
+            .unwrap();
+        let id = db.conn().last_insert_rowid();
+        (tmp, db, id)
+    }
+
+    #[test]
+    fn cache_key_is_stable_and_discriminates() {
+        let base = query_cache_key("hello", 5, true);
+        assert_eq!(base, query_cache_key("hello", 5, true));
+        assert_ne!(base, query_cache_key("hello", 5, false)); // semantic vs FTS
+        assert_ne!(base, query_cache_key("hello", 6, true)); // different k
+        assert_ne!(base, query_cache_key("world", 5, true)); // different query
+        assert!(base.starts_with("cache:"));
+    }
+
+    #[test]
+    fn cache_round_trips_ranked_hits() {
+        let (_tmp, db, id) = db_with_chunk();
+        let opts = SearchOpts::default();
+        let key = query_cache_key("q", 5, true);
+        assert!(read_query_cache(&db, &key, &opts).unwrap().is_none());
+
+        write_query_cache(&db, &key, &[(id, 0.9)]).unwrap();
+        let hits = read_query_cache(&db, &key, &opts)
+            .unwrap()
+            .expect("expected a cache hit");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol.as_deref(), Some("foo"));
+        assert!((hits[0].score - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn expired_entry_is_pruned_on_read() {
+        let (_tmp, db, id) = db_with_chunk();
+        let key = query_cache_key("q", 5, true);
+        let stale = CacheEntry {
+            ts: now_unix() - QUERY_CACHE_TTL_SECS - 1,
+            hits: vec![(id, 0.5)],
+        };
+        db.set_meta(&key, &serde_json::to_string(&stale).unwrap())
+            .unwrap();
+
+        assert!(read_query_cache(&db, &key, &SearchOpts::default())
+            .unwrap()
+            .is_none());
+        assert!(db.get_meta(&key).unwrap().is_none(), "stale entry not pruned");
+    }
+
+    #[test]
+    fn dangling_chunk_ids_drop_entry() {
+        let (_tmp, db, _id) = db_with_chunk();
+        let key = query_cache_key("q", 5, true);
+        write_query_cache(&db, &key, &[(999_999, 0.5)]).unwrap();
+        assert!(read_query_cache(&db, &key, &SearchOpts::default())
+            .unwrap()
+            .is_none());
+    }
 }

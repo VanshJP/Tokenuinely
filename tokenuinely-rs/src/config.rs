@@ -17,7 +17,12 @@ pub const HEADER_CONCURRENCY: usize = 16;
 pub const INDEX_DIRNAME: &str = ".tokenuinely/v2";
 pub const INDEX_FILENAME: &str = "index.db";
 /// Schema version stored in the `meta` table. Bumped → DB is wiped + rebuilt.
-pub const SCHEMA_VERSION: &str = "2";
+/// v3 added `chunks.body_sha256` for per-symbol hash-diff (skip re-embedding
+/// unchanged symbols inside a changed file).
+pub const SCHEMA_VERSION: &str = "3";
+/// Query-cache TTL in seconds. Identical `(query, k)` searches within this window
+/// reuse the prior result's chunk IDs and skip the Voyage embedding call.
+pub const QUERY_CACHE_TTL_SECS: i64 = 300;
 
 pub const DEFAULT_IGNORES: &[&str] = &[
     ".git",
@@ -41,6 +46,7 @@ pub const DEFAULT_IGNORES: &[&str] = &[
     ".tokenuinely",
     ".onetoken",
     "tokenuinely-index.zst",
+    "evals",
 ];
 
 pub const DEFAULT_IGNORE_EXTENSIONS: &[&str] = &[

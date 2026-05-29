@@ -1,7 +1,6 @@
-use crate::db::Db;
+use crate::db::{now_unix, Db};
 use anyhow::Result;
 use rusqlite::params;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 pub struct Adr {
@@ -12,10 +11,7 @@ pub struct Adr {
 }
 
 pub fn add_adr(db: &Db, title: &str, body: &str) -> Result<i64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = now_unix();
     db.conn().execute(
         "INSERT INTO adrs (title, body, created_at) VALUES (?1, ?2, ?3)",
         params![title, body, now],

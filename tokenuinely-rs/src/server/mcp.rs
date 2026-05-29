@@ -77,7 +77,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "tokenuinely__inspect_symbol",
-                "description": "One-shot lookup for a symbol: definition (file:line + source), callers, callees, and imports. Use to answer 'what would break if I change X' or 'where is X defined'. No API key needed.",
+                "description": "One-shot lookup for a symbol: definition (file:line + source), callers, callees, and imports. Use to answer 'what would break if I change X' or 'where is X defined'. On a miss, returns a `suggestions` list of similarly-named symbols (did-you-mean) — retry with one of those. No API key needed.",
                 "inputSchema": {"type": "object", "properties": {
                     "symbol": {"type": "string", "description": "Symbol name (exact match preferred)"},
                     "path": {"type": "string", "description": "Repo root (optional)"}
@@ -134,11 +134,34 @@ async fn handle_tool_call(name: &str, args: &Value, cfg: &Config) -> Result<Valu
             let symbol_rows = db.find_symbols(sym, None)?;
             let callers = db.get_callers(sym)?;
             let callees = db.get_callees(sym)?;
+            // Did-you-mean: when nothing matched the symbol exactly, surface up to 5
+            // fuzzy candidates so the agent can retry instead of getting an empty hit.
+            let exact_hit = definition.is_some()
+                || symbol_rows.iter().any(|s| s.name == sym);
+            let suggestions: Vec<Value> = if exact_hit {
+                Vec::new()
+            } else {
+                let mut seen = std::collections::HashSet::new();
+                symbol_rows
+                    .iter()
+                    .filter(|s| seen.insert(s.name.clone()))
+                    .take(5)
+                    .map(|s| {
+                        json!({
+                            "name": s.name,
+                            "kind": s.kind,
+                            "path": s.path,
+                            "line": s.line_start,
+                        })
+                    })
+                    .collect()
+            };
             text_result(&json!({
                 "definition": definition,
                 "symbol_rows": symbol_rows,
                 "callers": callers,
                 "callees": callees,
+                "suggestions": suggestions,
             }))
         }
         "tokenuinely__repo_overview" => {

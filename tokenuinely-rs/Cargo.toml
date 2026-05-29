@@ -5,6 +5,11 @@ edition = "2021"
 description = "Semantic codebase index for AI agents — replace grep/glob with one smart tool call"
 license = "MIT"
 repository = "https://github.com/VanshJP/Tokenuinely"
+homepage = "https://github.com/VanshJP/Tokenuinely"
+readme = "README.md"
+keywords = ["mcp", "code-search", "embeddings", "ai-agents", "semantic-search"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = ["tests/fixtures", ".tokenuinely", "evals"]
 
 [[bin]]
 name = "tokenuinely"
@@ -41,3 +46,8 @@ tree-sitter-c = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -73,6 +73,10 @@ pub type SymbolRow = (String, String, usize, usize, String, Option<String>);
 /// bulk-inserting into the `deps` table.
 pub type DepRow = (Option<String>, String, Option<String>, String);
 
+/// Map from `(symbol, body_sha256)` to a previously-computed `(header, embedding)`.
+/// Lets the indexer reuse work for chunks whose source body didn't change.
+pub type ReuseMap = std::collections::HashMap<(Option<String>, String), (String, Vec<f32>)>;
+
 /// One chunk to upsert. Constructed by the indexer from tree-sitter spans.
 pub struct PendingChunk {
     pub symbol: Option<String>,
@@ -81,6 +85,8 @@ pub struct PendingChunk {
     pub line_end: usize,
     pub source: String,
     pub parent: Option<String>,
+    /// SHA-256 of `source`. Lets a reindex skip header+embed for unchanged symbols.
+    pub body_sha256: String,
 }
 
 impl Db {
@@ -112,7 +118,11 @@ impl Db {
                 line_end INTEGER NOT NULL,
                 header TEXT NOT NULL,
                 source TEXT NOT NULL,
-                parent TEXT
+                parent TEXT,
+                -- SHA-256 of the chunk body, for per-symbol reuse on reindex. The ''
+                -- default is just a placeholder for any pre-hash row; real chunks always
+                -- write a hash (distinct from the ''-as-incomplete sentinel on files.sha256).
+                body_sha256 TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
             CREATE INDEX IF NOT EXISTS idx_chunks_symbol ON chunks(symbol);
@@ -174,7 +184,8 @@ impl Db {
             Some(_) => {
                 self.conn.execute_batch(
                     "DELETE FROM files; DELETE FROM chunks; DELETE FROM chunk_vecs; \
-                     DELETE FROM symbols; DELETE FROM deps;",
+                     DELETE FROM symbols; DELETE FROM deps; \
+                     DELETE FROM meta WHERE key LIKE 'cache:%';",
                 )?;
                 self.set_meta("schema_version", SCHEMA_VERSION)?;
                 Ok(())
@@ -210,10 +221,7 @@ impl Db {
         pending: &[(PendingChunk, String, Vec<f32>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = now_unix();
 
         // 1) file row
         tx.execute(
@@ -239,8 +247,8 @@ impl Db {
         // 3) insert new chunks + vecs
         for (chunk, header, embedding) in pending {
             tx.execute(
-                "INSERT INTO chunks (path, symbol, kind, line_start, line_end, header, source, parent) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO chunks (path, symbol, kind, line_start, line_end, header, source, parent, body_sha256) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     path,
                     &chunk.symbol,
@@ -250,10 +258,11 @@ impl Db {
                     header,
                     &chunk.source,
                     &chunk.parent,
+                    &chunk.body_sha256,
                 ],
             )?;
             let id = tx.last_insert_rowid();
-            let blob: Vec<u8> = embedding.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let blob = encode_embedding(embedding);
             tx.execute(
                 "INSERT INTO chunk_vecs (chunk_id, embedding) VALUES (?1, ?2)",
                 params![id, blob],
@@ -497,15 +506,45 @@ impl Db {
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(rec, blob)| {
-                let emb: Vec<f32> = blob
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                (rec, emb)
-            })
+            .map(|(rec, blob)| (rec, decode_embedding(&blob)))
             .collect();
         Ok(rows)
+    }
+
+    /// Map `(symbol, body_sha256) → (header, embedding)` for a file's currently-stored
+    /// chunks. The indexer uses this to carry an unchanged symbol's header+embedding
+    /// forward across a reindex instead of paying for fresh Anthropic + Voyage calls.
+    pub fn existing_chunks_for_reuse(&self, path: &str) -> Result<ReuseMap> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.symbol, c.body_sha256, c.header, cv.embedding \
+             FROM chunks c JOIN chunk_vecs cv ON cv.chunk_id = c.id \
+             WHERE c.path = ?1 AND c.body_sha256 != ''",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        let mut rows = stmt.query(params![path])?;
+        while let Some(row) = rows.next()? {
+            let symbol: Option<String> = row.get(0)?;
+            let body_sha: String = row.get(1)?;
+            let header: String = row.get(2)?;
+            let blob: Vec<u8> = row.get(3)?;
+            out.insert((symbol, body_sha), (header, decode_embedding(&blob)));
+        }
+        Ok(out)
+    }
+
+    pub fn delete_meta(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM meta WHERE key=?1", params![key])?;
+        Ok(())
+    }
+
+    /// Drop every cached query result. Called on reindex (chunk IDs are reassigned)
+    /// and by `tokenuinely cache clear`.
+    pub fn clear_query_cache(&self) -> Result<usize> {
+        let n = self
+            .conn
+            .execute("DELETE FROM meta WHERE key LIKE 'cache:%'", [])?;
+        Ok(n)
     }
 }
 
@@ -543,4 +582,25 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     } else {
         dot / (na * nb)
     }
+}
+
+/// On-disk embedding encoding: little-endian f32s. Tied to the `EMBED_DIM`/`voyage-3`
+/// invariant — keep encode/decode as the single pair of functions that know the layout.
+pub fn encode_embedding(emb: &[f32]) -> Vec<u8> {
+    emb.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+pub fn decode_embedding(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Seconds since the Unix epoch, as the i64 used by `indexed_at` / ADR timestamps /
+/// the query cache. Falls back to 0 if the clock is before the epoch.
+pub fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

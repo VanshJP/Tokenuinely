@@ -9,7 +9,7 @@ Each item lists: **why**, **rough shape**, **how to know it worked**.
 
 ## P0 — adoption blockers
 
-### 1. Per-symbol hash diff
+### 1. Per-symbol hash diff — ✅ DONE
 
 **Why.** Today the indexer hashes whole files. Changing one line in a 30-symbol
 file re-runs 30 Anthropic header calls and 30 Voyage embeddings. On a hot file
@@ -52,7 +52,7 @@ chunk; measure top-1 hit rate before/after. Target: ≥30% reduction in
 
 ---
 
-### 3. Eval harness
+### 3. Eval harness — ✅ DONE (`tokenuinely eval`)
 
 **Why.** Right now changes to the ranking pipeline are vibes. We have no way to
 know whether bumping `WEIGHT_VEC` from 0.55 to 0.65 made things better or
@@ -135,7 +135,7 @@ currently spent in `populate_fts`. Measure via the eval harness (P0-#3).
 
 ## P2 — agent ergonomics
 
-### 7. Fuzzy fallback in `inspect_symbol`
+### 7. Fuzzy fallback in `inspect_symbol` — ✅ DONE
 
 **Why.** `tokenuinely__inspect_symbol` requires an exact symbol-name match
 today. Agents routinely guess "loginUser" when the actual symbol is
@@ -152,7 +152,7 @@ repo returns `upsert_file_chunks` as a suggestion.
 
 ---
 
-### 8. Query result caching
+### 8. Query result caching — ✅ DONE (`tokenuinely cache clear`)
 
 **Why.** Agents ask the same question multiple times in a session ("show me
 the auth code", then 10 minutes later "where's the auth code again"). Each

@@ -2,6 +2,7 @@ mod adr;
 mod config;
 mod db;
 mod detect_changes;
+mod eval;
 mod export;
 mod hasher;
 mod index;
@@ -140,6 +141,20 @@ enum Commands {
         #[command(subcommand)]
         command: AdrCommands,
     },
+    /// Manage the query result cache
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommands,
+    },
+    /// Run the retrieval eval harness over a JSONL query set
+    Eval {
+        /// Path to the labelled queries file (JSONL)
+        #[arg(long, default_value = "evals/queries.jsonl")]
+        queries: PathBuf,
+        /// Path to the repo root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Register MCP + hook with Claude Code, append CLAUDE.md hint, run initial index
     Setup {
         /// Path to the repo root
@@ -151,6 +166,11 @@ enum Commands {
         /// Skip initial indexing
         #[arg(long)]
         skip_index: bool,
+        /// Claude Code MCP scope: `local` (this project, private), `project`
+        /// (shared via .mcp.json), or `user` (all your repos — pairs with the
+        /// server's cwd-based repo resolution). Default: local.
+        #[arg(long, default_value = "local")]
+        scope: String,
     },
 }
 
@@ -165,6 +185,16 @@ enum AdrCommands {
     },
     /// List all Architecture Decision Records
     List {
+        /// Path to the repo root
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCommands {
+    /// Drop all cached query results
+    Clear {
         /// Path to the repo root
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -189,14 +219,22 @@ async fn main() -> Result<()> {
             let cfg = config::Config::load()?;
             let stats = index::indexer::index_repo(&path, &cfg).await?;
             eprintln!(
-                "Done: {} scanned, {} unchanged, {} indexed ({} chunks), {} deleted, {} failed",
+                "Done: {} scanned, {} unchanged, {} indexed ({} chunks, {} reused), {} partial, {} deleted, {} failed",
                 stats.scanned,
                 stats.unchanged,
                 stats.indexed,
                 stats.chunks,
+                stats.reused_chunks,
+                stats.partial,
                 stats.deleted,
                 stats.failed.len()
             );
+            if stats.partial > 0 {
+                eprintln!(
+                    "  {} file(s) partially indexed (some chunks failed); re-run `index` to retry just the missing chunks.",
+                    stats.partial
+                );
+            }
             for (file, err) in &stats.failed {
                 eprintln!("  FAIL {}: {}", file, err);
             }
@@ -379,22 +417,40 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Commands::Cache { command } => match command {
+            CacheCommands::Clear { path } => {
+                let path = std::fs::canonicalize(&path)?;
+                let db = db::Db::open(&path)?;
+                let n = db.clear_query_cache()?;
+                println!("Cleared {} cached query result(s).", n);
+            }
+        },
+        Commands::Eval { queries, path } => {
+            let path = std::fs::canonicalize(&path)?;
+            let cfg = config::Config::load()?;
+            eval::run_eval(&path, &queries, &cfg).await?;
+        }
         Commands::Setup {
             path,
             skip_claude_md,
             skip_index,
+            scope,
         } => {
             let path = std::fs::canonicalize(&path)?;
             let bin_path = std::env::current_exe()?;
             let bin_str = bin_path.to_string_lossy();
 
-            // Register MCP server with Claude Code
-            eprintln!("Registering MCP server with Claude Code...");
+            // Register MCP server with Claude Code. `user` scope makes one
+            // registration serve every repo (the server resolves the target repo
+            // from the working directory), which is what you want across many repos.
+            eprintln!("Registering MCP server with Claude Code (scope: {})...", scope);
             let mcp_status = std::process::Command::new("claude")
                 .args([
                     "mcp",
                     "add",
                     "tokenuinely",
+                    "--scope",
+                    &scope,
                     "--transport",
                     "stdio",
                     "--",
@@ -408,6 +464,10 @@ async fn main() -> Result<()> {
                     "Warning: Could not register MCP server (is `claude` CLI installed?)."
                 ),
             }
+
+            // Keep the index out of version control — it's large and holds source
+            // snippets. Idempotent: only appends if not already ignored.
+            ensure_gitignored(&path, ".tokenuinely/");
 
             // Register hook
             eprintln!("Registering PreToolUse hook...");
@@ -461,4 +521,29 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Append `entry` to the repo's `.gitignore` if it isn't already ignored. Best-effort:
+/// failures are reported but never abort setup.
+fn ensure_gitignored(repo_root: &std::path::Path, entry: &str) {
+    let gitignore = repo_root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gitignore).unwrap_or_default();
+    // Match the entry with or without a trailing slash so we don't double-add.
+    let needle = entry.trim_end_matches('/');
+    let already = existing
+        .lines()
+        .any(|l| l.trim().trim_end_matches('/') == needle);
+    if already {
+        return;
+    }
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(entry);
+    content.push('\n');
+    match std::fs::write(&gitignore, content) {
+        Ok(()) => eprintln!("Added {} to .gitignore", entry),
+        Err(e) => eprintln!("Warning: could not update .gitignore: {}", e),
+    }
 }
