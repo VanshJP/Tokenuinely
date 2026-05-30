@@ -14,18 +14,7 @@ carries a real symbol/dependency graph (callers, callees, imports, dead-code).
 
 ## Install
 
-Once a release is tagged, install with any of:
-
 ```bash
-# Prebuilt binary (macOS / Linux / Windows) — no toolchain needed
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/VanshJP/Tokenuinely/releases/latest/download/tokenuinely-installer.sh | sh
-
-# Homebrew
-brew install VanshJP/tap/tokenuinely
-
-# npm
-npm install -g tokenuinely
-
 # From crates.io (needs a Rust toolchain)
 cargo install tokenuinely
 ```

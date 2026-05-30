@@ -14,8 +14,7 @@ database at `.tokenuinely/v2/index.db`. A coding agent queries the index through
 MCP tools instead of grepping.
 
 The project is a single Rust crate in `tokenuinely-rs/` (binary `tokenuinely`,
-edition 2021). The git repo root (`Tokenuinely/`) holds release tooling
-(`dist-workspace.toml`, `.github/workflows/release.yml`).
+edition 2021). Distribution is via crates.io (`cargo publish`).
 
 ## Dev environment
 
